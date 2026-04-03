@@ -1,0 +1,29 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - ENV=production
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      - ARANGO_HOST=10.0.0.1
+      - ARANGO_PORT=8529
+      - ARANGO_USER=${ARANGO_USER:-system}
+      - ARANGO_PASSWORD=${ARANGO_PASSWORD}
+      - ARANGO_DB=${ARANGO_DB:-langchain}
+    ports:
+      - '8000:8000'
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--loop", "uvloop"]
