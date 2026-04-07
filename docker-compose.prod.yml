@@ -1,11 +1,45 @@
 services:
+  node-api:
+    build:
+      context: ./node-api
+      dockerfile: Dockerfile
+    environment:
+      - ENV=production
+      - PORT=3000
+      - RAG_URL=${RAG_URL:-http://app:8000}
+      - ARANGO_URL=${ARANGO_URL:-http://10.0.0.1:8529}
+      - ARANGO_USER=${ARANGO_USER:-system}
+      - ARANGO_PASSWORD=${ARANGO_PASSWORD}
+      - ARANGO_DB=${ARANGO_DB:-langchain}
+    ports:
+      - '3000:3000'
+    restart: unless-stopped
+    depends_on:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
   app:
     build:
       context: .
       dockerfile: Dockerfile
     environment:
       - ENV=production
+      - PORT=8000
       - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-deepseek-coder:6.7b}
+      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-120}
+      - LANGSMITH_TRACING=${LANGSMITH_TRACING:-true}
+      - LANGSMITH_ENDPOINT=${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
+      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
+      - LANGSMITH_PROJECT=${LANGSMITH_PROJECT:-agri-dao-rag}
+      - COUCHDB_BASE_URL=${COUCHDB_BASE_URL}
+      - COUCHDB_USER=${COUCHDB_USER}
+      - COUCHDB_PASSWORD=${COUCHDB_PASSWORD}
+      - COUCHDB_DATABASE=${COUCHDB_DATABASE:-jira_issue}
       - ARANGO_HOST=10.0.0.1
       - ARANGO_PORT=8529
       - ARANGO_USER=${ARANGO_USER:-system}
@@ -27,3 +61,48 @@ services:
         max-size: '10m'
         max-file: '3'
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--loop", "uvloop"]
+
+  jira-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - ENV=production
+      - COUCHDB_BASE_URL=${COUCHDB_BASE_URL}
+      - COUCHDB_USER=${COUCHDB_USER}
+      - COUCHDB_PASSWORD=${COUCHDB_PASSWORD}
+      - COUCHDB_DATABASE=${COUCHDB_DATABASE:-jira_issue}
+      - JIRA_WORKER_POLL_SECONDS=${JIRA_WORKER_POLL_SECONDS:-2.0}
+      - JIRA_WORKER_MAX_RETRIES=${JIRA_WORKER_MAX_RETRIES:-3}
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.jira_worker"]
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  reference-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - ENV=production
+      - COUCHDB_BASE_URL=${COUCHDB_BASE_URL}
+      - COUCHDB_USER=${COUCHDB_USER}
+      - COUCHDB_PASSWORD=${COUCHDB_PASSWORD}
+      - COUCHDB_DATABASE=${COUCHDB_DATABASE:-jira_issue}
+      - ARANGO_URL=${ARANGO_URL:-http://10.0.0.1:8529}
+      - ARANGO_USER=${ARANGO_USER:-system}
+      - ARANGO_ROOT_PASSWORD=${ARANGO_PASSWORD}
+      - ARANGO_DB=${ARANGO_DB:-langchain}
+      - REFERENCE_WORKER_POLL_SECONDS=${REFERENCE_WORKER_POLL_SECONDS:-3.0}
+      - REFERENCE_WORKER_MAX_RETRIES=${REFERENCE_WORKER_MAX_RETRIES:-3}
+      - REFERENCE_FETCH_TIMEOUT=${REFERENCE_FETCH_TIMEOUT:-12}
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.reference_worker"]
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'

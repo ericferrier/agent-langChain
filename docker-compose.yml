@@ -1,8 +1,70 @@
 services:
+  node-api:
+    build:
+      context: ./node-api
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      - PORT=3000
+      - RAG_URL=${RAG_URL:-http://app:8000}
+    depends_on:
+      - app
   app:
     build: .
     env_file: .env
+    environment:
+      - PORT=8000
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-deepseek-coder:6.7b}
+      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-120}
+      - LANGSMITH_TRACING=${LANGSMITH_TRACING:-true}
+      - LANGSMITH_ENDPOINT=${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
+      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
+      - LANGSMITH_PROJECT=${LANGSMITH_PROJECT:-agri-dao-rag}
+      - COUCHDB_BASE_URL=${COUCHDB_BASE_URL}
+      - COUCHDB_USER=${COUCHDB_USER}
+      - COUCHDB_PASSWORD=${COUCHDB_PASSWORD}
+      - COUCHDB_DATABASE=${COUCHDB_DATABASE:-jira_issue}
     ports:
       - "8000:8000"
     volumes:
       - ./app:/app/app
+
+  jira-worker:
+    build: .
+    env_file: .env
+    environment:
+      - COUCHDB_BASE_URL=${COUCHDB_BASE_URL}
+      - COUCHDB_USER=${COUCHDB_USER}
+      - COUCHDB_PASSWORD=${COUCHDB_PASSWORD}
+      - COUCHDB_DATABASE=${COUCHDB_DATABASE:-jira_issue}
+      - JIRA_WORKER_POLL_SECONDS=${JIRA_WORKER_POLL_SECONDS:-2.0}
+      - JIRA_WORKER_MAX_RETRIES=${JIRA_WORKER_MAX_RETRIES:-3}
+    command: ["python", "-m", "app.workers.jira_worker"]
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      - app
+
+  reference-worker:
+    build: .
+    env_file: .env
+    environment:
+      - COUCHDB_BASE_URL=${COUCHDB_BASE_URL}
+      - COUCHDB_USER=${COUCHDB_USER}
+      - COUCHDB_PASSWORD=${COUCHDB_PASSWORD}
+      - COUCHDB_DATABASE=${COUCHDB_DATABASE:-jira_issue}
+      - ARANGO_URL=${ARANGO_URL:-http://10.0.0.1:8529}
+      - ARANGO_USER=${ARANGO_USER:-system}
+      - ARANGO_ROOT_PASSWORD=${ARANGO_PASSWORD}
+      - ARANGO_DB=${ARANGO_DB:-langchain}
+      - REFERENCE_WORKER_POLL_SECONDS=${REFERENCE_WORKER_POLL_SECONDS:-3.0}
+      - REFERENCE_WORKER_MAX_RETRIES=${REFERENCE_WORKER_MAX_RETRIES:-3}
+      - REFERENCE_FETCH_TIMEOUT=${REFERENCE_FETCH_TIMEOUT:-12}
+      - REFERENCE_WEB_FETCH_ENABLED=${REFERENCE_WEB_FETCH_ENABLED:-false}
+    command: ["python", "-m", "app.workers.reference_worker"]
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      - app

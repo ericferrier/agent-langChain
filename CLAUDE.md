@@ -17,7 +17,7 @@ Build a small support application where a human user asks a support-focused ques
 - No unrelated brainstorming, coding help, or open-ended LLM usage
 - Clear escalation path to Jira when no reliable answer is found
 
-## Phase 1: Requirements And Scope
+## Phase 1: Requirements And Scope ← CURRENT PHASE
 
 - Define the exact support scope the assistant is allowed to handle
 - List supported issue categories
@@ -26,6 +26,23 @@ Build a small support application where a human user asks a support-focused ques
 - Define escalation triggers for Jira ticket creation
 - Define required metadata for a ticket: summary, description, priority, reporter, component, labels
 - Decide whether users are anonymous, authenticated, or internal-only
+
+### Resource Visibility Model
+
+Every resource in the `resource` collection carries a `visibility` field that controls access at the retrieval layer.
+
+| Value | Who can access | Description |
+|---|---|---|
+| `public` | Anyone (anonymous or logged-in) | General trade, customs, and compliance references. All 267 seeded resources are `public`. |
+| `system` | Verified trusted accounts only | Privileged runbooks, internal pricing data, escalation playbooks, admin procedures, or any resource that requires an authenticated and DAO-verified identity before exposure. |
+
+**Current state:** all seeded resources are `public`.
+
+**Adding `system` resources:** set `"visibility": "system"` in the resource entry in `db/init/02_resources.py`. The retrieval layer in `app/services/resource_search.py` must filter on `visibility` based on the caller's trust level before returning results.
+
+**Retrieval rule (to implement in Phase 3):**
+- Anonymous / unauthenticated callers → `FILTER r.visibility == "public"`
+- Verified trusted account callers → no visibility filter (sees `public` + `system`)
 
 ## Phase 2: UX And Application Flow
 
@@ -105,6 +122,7 @@ Build a small support application where a human user asks a support-focused ques
 #### Region Packs To Maintain
 
 - `africa`: agricultural market access, export requirements, payment/FX constraints, local compliance notes
+- `australia`: wholesale pricing benchmarks, horticulture market reporting, export documentation, and regulatory guidance
 - `caribbean`: island-specific shipping, customs, and trade corridor support notes
 - `central_america`: producer verification, cross-border trade, and export documentation support
 - `east_asia`: licensing, trade documentation, translation, and jurisdiction-specific restrictions
@@ -148,6 +166,7 @@ Build a small support application where a human user asks a support-focused ques
 - marketplace-listing
 - export-documents
 - shipping-logistics
+- pricing
 - payment-settlement
 - compliance-region
 - account-access
@@ -200,6 +219,24 @@ Build a small support application where a human user asks a support-focused ques
 - Store user feedback on whether the answer solved the issue
 - Add audit logs for ticket creation actions
 - Decide whether ArangoDB will hold conversations, tickets, and knowledge metadata
+
+### ArangoDB Access Convention
+
+**All ArangoDB access in this project uses `curl -4` HTTP REST calls, not the `python-arango` client library.**
+
+ArangoDB is accessed over a **WireGuard VPN tunnel** at `http://10.0.0.1:8529`. The `-4` flag is required to force IPv4 and route correctly through the WireGuard interface.
+
+`python-arango` has a known connectivity failure in this environment (exits with code 1) — its internal connection pool/resolver does not route through the WireGuard interface reliably. `curl -4` and `httpx` both use the OS network stack directly, which respects WireGuard routing and work correctly.
+
+Every service file that reads or writes ArangoDB must use `httpx` (async services) or `curl -4` (seed scripts).
+
+| Layer | Method | Example |
+|---|---|---|
+| Seed scripts (`db/init/`) | `curl -4` via `subprocess` or shell | `02_resources.py` |
+| Service layer (`app/services/`, `app/checkpointer/`) | `httpx.AsyncClient` | `resource_search.py`, `arango_cp.py` |
+| One-off queries / debugging | `curl -4 -u system:PASSWORD` | Terminal |
+
+**Do not add `python-arango` calls anywhere.** If a new service needs ArangoDB access, follow the `httpx` pattern in `app/services/resource_search.py`.
 
 ## Phase 10: Security And Access Control
 

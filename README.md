@@ -3,6 +3,11 @@
 ## TODO:
 Creating a Hugging Face account
 
+ARANGO_URL=http://10.0.0.1:8529 ARANGO_USER=system ARANGO_ROOT_PASSWORD=oDfRxtaGnzr20 ARANGO_DB=agri_dao \
+  /Users/ericferrier/Documents/GitHub/agri-dao-app/.venv/bin/python -u db/init/01_init.py && \
+  ARANGO_URL=http://10.0.0.1:8529 ARANGO_USER=system ARANGO_ROOT_PASSWORD=oDfRxtaGnzr20 ARANGO_DB=agri_dao \
+  /Users/ericferrier/Documents/GitHub/agri-dao-app/.venv/bin/python -u db/init/02_resources.py
+
 
 ## 1. Install & 
 ```bash
@@ -17,6 +22,147 @@ ollama serve
 > Keep `ollama serve` running in a separate terminal tab.
 ```bash
 ollama serve
+```
+
+## Start stack
+ docker compose -f docker-compose.prod.yml up -d
+
+## Verify container
+ docker compose -f docker-compose.prod.yml ps
+
+ ## End Points
+ http://localhost:8000
+http://localhost:3000
+
+
+curl -sS http://localhost:11434/api/tags
+
+### Mock Jira endpoint (CouchDB)
+
+- `POST /jira/mock`
+- Purpose: create a standardized mock Jira issue document in CouchDB
+- Env vars used:
+  - `COUCHDB_BASE_URL`
+  - `COUCHDB_USER`
+  - `COUCHDB_PASSWORD`
+  - `COUCHDB_DATABASE` (optional, defaults to `jira_issue`)
+
+Example request:
+
+```bash
+curl -X POST http://localhost:8000/jira/mock \
+  -H "Content-Type: application/json" \
+  -d '{
+    "summary": "Low confidence compliance response",
+    "description": "Escalating from public support flow",
+    "priority": "high",
+    "reporter": "public_user",
+    "component": "support",
+    "labels": ["escalation", "compliance"],
+    "category": "compliance",
+    "region_id": "north_america",
+    "session_id": "example-session-id",
+    "escalation_reason": "requires_login_or_authenticated_internal_support"
+  }'
+```
+
+### Async Jira workflow (recommended)
+
+- `POST /jira/enqueue`
+  - enqueues Jira mock issue job and returns `202` with `job_id`
+- `GET /jira/job/{job_id}`
+  - returns job status (`pending`, `processing`, `created`, `failed`)
+- `jira-worker` service
+  - polls pending jobs and writes finalized issue documents to CouchDB
+
+Example enqueue request:
+
+```bash
+curl -X POST http://localhost:8000/jira/enqueue \
+  -H "Content-Type: application/json" \
+  -d '{
+    "summary": "Low confidence compliance response",
+    "description": "Escalating from public support flow",
+    "priority": "high",
+    "reporter": "public_user",
+    "component": "support",
+    "labels": ["escalation", "compliance"],
+    "category": "compliance",
+    "region_id": "north_america",
+    "session_id": "example-session-id",
+    "escalation_reason": "requires_login_or_authenticated_internal_support"
+  }'
+```
+
+Example status check:
+
+```bash
+curl -sS http://localhost:8000/jira/job/<job_id>
+```
+
+
+## LangSmith tracing
+
+- The Python app is configured to send LangChain and LangGraph traces to LangSmith.
+- Required `.env` values:
+  - `LANGSMITH_API_KEY`
+  - `LANGSMITH_TRACING=true`
+  - `LANGSMITH_PROJECT=agri-dao-rag` (or your preferred project name)
+- After changing tracing settings, rebuild and restart the app service:
+
+```bash
+docker compose -f docker-compose.prod.yml build app
+docker compose -f docker-compose.prod.yml up -d app
+docker compose -f docker-compose.prod.yml logs -f app
+```
+
+- Verify locally:
+  - `http://localhost:8000/health`
+- Verify in LangSmith:
+  - `https://smith.langchain.com`
+
+## Response Contract (RAG)
+
+The RAG response now uses a consistent shape for both success and fallback paths.
+
+Core fields:
+
+- `status`: `ok` or `degraded_fallback`
+- `verified`: boolean
+- `verification_status`: `verified` or `unverified`
+- `llm_available`: boolean
+- `should_retry`: boolean
+- `confidence`: number (0.0 to 1.0)
+- `confidence_label`: `low`, `medium`, or `high`
+- `escalate`: boolean
+- `escalation_reason`: string
+- `error`: empty string on success, populated on fallback
+
+Fallback behavior when Ollama is unavailable:
+
+- returns `status=degraded_fallback`
+- returns `verified=false`
+- returns `verification_status=unverified`
+- returns `llm_available=false`
+- returns `should_retry=true`
+- preserves request context fields (`query`, `tier`, `region_id`, `session_id` when available)
+
+This prevents worker lock-ups and gives frontend/backend a deterministic branch for retry/escalation.
+
+## Troubleshooting
+
+If you see `Unable to generate an answer from Ollama`:
+
+1. Confirm Ollama server is running on host:
+  - `curl -sS http://localhost:11434/api/tags`
+2. Confirm app health and tracing flags:
+  - `curl -sS http://localhost:8000/health`
+3. Rebuild and restart containers after code/config changes:
+
+```bash
+docker compose -f docker-compose.prod.yml build app node-api
+docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml logs -f app node-api
 ```
 
 
