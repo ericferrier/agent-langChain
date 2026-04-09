@@ -5,6 +5,7 @@ Fetches HTML from URLs and extracts relevant text content to store in ArangoDB.
 Handles errors gracefully - partial failures don't block the RAG chain.
 """
 import asyncio
+import hashlib
 import os
 from datetime import timedelta
 from datetime import datetime, timezone
@@ -18,6 +19,19 @@ QUERY_CONTENT_COLLECTION = os.getenv("ARANGO_QUERY_CONTENT_COLLECTION", "query_c
 QUERY_CONTENT_TTL_HOURS = int(os.getenv("ARANGO_QUERY_CONTENT_TTL_HOURS", "24"))
 # 0 means unlimited storage (bounded only by Arango document size limits).
 QUERY_CONTENT_MAX_CHARS = int(os.getenv("ARANGO_QUERY_CONTENT_MAX_CHARS", "0"))
+
+
+def _resource_lookup_key(resource: dict) -> str:
+    key = str(resource.get("_key") or "").strip()
+    if key:
+        return key
+
+    url = str(resource.get("url") or "").strip().lower()
+    if not url:
+        return ""
+
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+    return f"url_{digest}"
 
 
 def _arango_base() -> str:
@@ -86,7 +100,18 @@ async def fetch_and_extract(url: str, timeout_s: float = 10.0) -> Optional[str]:
     try:
         timeout = httpx.Timeout(timeout=timeout_s, connect=min(5.0, timeout_s))
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url, follow_redirects=True)
+            response = await client.get(
+                url,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
             response.raise_for_status()
             html = response.text
 
@@ -189,9 +214,10 @@ async def fetch_resources_content(
 
     for resource in resources[:6]:
         url = resource.get("url")
-        key = resource.get("_key")
+        key = _resource_lookup_key(resource)
         if url and key:
-            resource_map[key] = (url, resource)
+            resource_with_key = resource if resource.get("_key") else {**resource, "_key": key}
+            resource_map[key] = (url, resource_with_key)
             tasks.append(fetch_and_extract(url, timeout_s=timeout_s))
 
     if not tasks:
@@ -234,7 +260,7 @@ def inject_content_into_resources(
     """
     enhanced = []
     for resource in resources:
-        key = resource.get("_key")
+        key = _resource_lookup_key(resource)
         content = content_map.get(key) if content_map else resource.get("fetched_content")
         if content:
             enhanced.append({**resource, "fetched_content": content})

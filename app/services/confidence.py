@@ -3,15 +3,15 @@ Confidence scoring for RAG answers.
 
 Score range: 0.0 – 1.0
   >= 0.70  → satisfactory, no escalation needed
-  0.40–0.69 → borderline, offer user "was this helpful?" with escalation option
-  < 0.40   → low confidence, auto-escalate to Jira
+    0.40–0.69 → borderline, offer user "was this helpful?" with manual escalation option
+    < 0.40   → low confidence, manual escalation available
 
 Score is derived from three independent signals:
   1. Retrieval coverage  – how many resources were returned, and how good are they
   2. Source quality      – rank of the best source_type among returned resources
   3. Model uncertainty   – hedge phrases detected in the LLM answer text
 
-Hard overrides (force escalation regardless of score):
+Hard overrides (force low confidence regardless of score):
   - Zero resources returned from ArangoDB
   - Query contains a high-severity keyword (sanctions, fraud, dispute, legal)
   - LLM answer is empty or contains a failure message
@@ -123,26 +123,30 @@ def score_answer(
     Returns:
         {
             "confidence": float,          # 0.0–1.0
-            "escalate": bool,             # True = create Jira ticket
-            "escalation_reason": str,     # human-readable reason if escalate=True
+            "escalate": bool,             # False by default; Jira escalation is user-triggered
+            "escalation_reason": str,     # human-readable guidance/reason
             "label": str,                 # "satisfactory" | "borderline" | "low"
         }
     """
     answer_lower = answer.lower()
 
-    # --- Hard override: no resources at all
+    # --- Hard override: no resources at all (low confidence, manual escalation only)
     if not resources:
-        return _decision(0.0, True, "No supporting resources found in knowledge base")
+        return _decision(
+            0.2,
+            False,
+            "No supporting resources found in knowledge base; use Brave Ask cross-reference and escalate manually if needed",
+        )
 
-    # --- Hard override: LLM failure message
+    # --- Hard override: LLM failure message (manual escalation only)
     if "unable to generate" in answer_lower or not answer.strip():
-        return _decision(0.0, True, "LLM failed to produce an answer")
+        return _decision(0.1, False, "LLM failed to produce a reliable answer; manual escalation recommended")
 
-    # --- Hard override: high-severity query keyword
+    # --- Hard override: high-severity query keyword (manual escalation only)
     query_lower = query.lower()
     for kw in _HIGH_SEVERITY_KEYWORDS:
         if kw in query_lower:
-            return _decision(0.1, True, f"High-severity topic detected: '{kw}'")
+            return _decision(0.35, False, f"High-severity topic detected: '{kw}' — manual escalation recommended")
 
     # --- Compute composite score
     r_score = _retrieval_score(resources)       # weight 0.40
@@ -155,9 +159,9 @@ def score_answer(
     if confidence >= SATISFACTORY:
         return _decision(confidence, False, "")
     elif confidence >= BORDERLINE_LOW:
-        return _decision(confidence, False, "borderline — offer user escalation option")
+        return _decision(confidence, False, "borderline — offer user manual escalation option")
     else:
-        return _decision(confidence, True, "Low confidence: insufficient evidence or high uncertainty")
+        return _decision(confidence, False, "Low confidence: insufficient evidence or high uncertainty; manual escalation available")
 
 
 def _decision(confidence: float, escalate: bool, reason: str) -> dict:

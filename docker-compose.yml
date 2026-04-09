@@ -1,23 +1,13 @@
 services:
-  node-api:
-    build:
-      context: ./node-api
-      dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
-    env_file: .env
-    environment:
-      - PORT=3000
-      - RAG_URL=${RAG_URL:-http://app:8000}
-    depends_on:
-      - app
   app:
     build: .
     env_file: .env
     environment:
       - PORT=8000
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      - NODE_API_URL=${NODE_API_URL:-http://host.docker.internal:3000}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-deepseek-coder:6.7b}
-      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-120}
+      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-180}
       - LANGSMITH_TRACING=${LANGSMITH_TRACING:-true}
       - LANGSMITH_ENDPOINT=${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
       - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
@@ -28,6 +18,8 @@ services:
       - COUCHDB_DATABASE=${COUCHDB_DATABASE:-jira_issue}
     ports:
       - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./app:/app/app
 

@@ -11,6 +11,7 @@ import json
 import os
 import re
 from typing import Optional
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 
@@ -34,6 +35,115 @@ TOPIC_KEYWORDS: dict[str, list[str]] = {
     "marketplace-listing": ["marketplace", "listing", "catalog", "buyer", "seller", "product posting"],
     "pricing": ["price", "pricing", "market rate", "index", "trend", "quotation"],
 }
+
+_QUERYABLE_SITE_RULES: list[dict[str, str]] = [
+    {
+        "domain": "apps.fas.usda.gov",
+        "path_prefix": "/gats",
+        "title": "USDA GATS query results",
+        "source": "USDA FAS GATS",
+    },
+    {
+        "domain": "fas.usda.gov",
+        "path_prefix": "/",
+        "title": "USDA FAS site search results",
+        "source": "USDA FAS",
+    },
+]
+
+
+def _query_mentions_usda_gats(query: str) -> bool:
+    q = (query or "").lower()
+    return any(token in q for token in ["usda", "fas", "gats", "global agricultural trade system"])
+
+
+def _get_arango_connection_params() -> dict:
+    """Extract ArangoDB connection parameters from environment."""
+    arango_url = os.getenv("ARANGO_URL", "").rstrip("/")
+    if not arango_url:
+        arango_host = os.getenv("ARANGO_HOST", "host.docker.internal")
+        arango_port = os.getenv("ARANGO_PORT", "8529")
+        arango_url = f"http://{arango_host}:{arango_port}"
+    
+    return {
+        "url": arango_url,
+        "db": os.getenv("ARANGO_DB", "agri_dao"),
+        "user": os.getenv("ARANGO_USER", "system"),
+        "password": os.getenv("ARANGO_ROOT_PASSWORD") or os.getenv("ARANGO_PASSWORD", ""),
+        "timeout": float(os.getenv("ARANGO_TIMEOUT", "10")),
+    }
+
+
+async def _ensure_site_rules_collection() -> None:
+    """Ensure queryable_site_rules collection exists with default rules on startup."""
+    params = _get_arango_connection_params()
+    endpoint = f"{params['url']}/_db/{params['db']}/_api/collection"
+    collection_name = "queryable_site_rules"
+    
+    try:
+        async with httpx.AsyncClient(timeout=params["timeout"]) as client:
+            # Check if collection exists
+            resp = await client.get(
+                f"{params['url']}/_db/{params['db']}/_api/collection/{collection_name}",
+                auth=(params["user"], params["password"]),
+            )
+            
+            if resp.status_code == 404:
+                # Create collection
+                await client.post(
+                    endpoint,
+                    json={"name": collection_name, "type": 2},
+                    auth=(params["user"], params["password"]),
+                )
+            
+            # Upsert default rules (replace any existing ones)
+            for i, rule in enumerate(_QUERYABLE_SITE_RULES):
+                rule_doc = {
+                    "_key": f"rule_{i}",
+                    **rule,
+                }
+                insert_endpoint = f"{params['url']}/_db/{params['db']}/_api/document/{collection_name}"
+                await client.post(
+                    insert_endpoint,
+                    json=rule_doc,
+                    params={"overwrite": "true"},
+                    auth=(params["user"], params["password"]),
+                )
+    except Exception as e:
+        # Non-fatal: fallback to defaults will be used
+        pass
+
+
+async def _get_queryable_site_rules() -> list[dict]:
+    """Fetch queryable site rules from ArangoDB, fallback to defaults on error."""
+    params = _get_arango_connection_params()
+    endpoint = f"{params['url']}/_db/{params['db']}/_api/cursor"
+    
+    aql = "FOR doc IN queryable_site_rules RETURN doc"
+    payload = {"query": aql}
+    
+    try:
+        async with httpx.AsyncClient(timeout=params["timeout"]) as client:
+            resp = await client.post(
+                endpoint,
+                json=payload,
+                auth=(params["user"], params["password"]),
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            rules = data.get("result", [])
+            if rules:
+                # Remove ArangoDB internal fields
+                return [
+                    {k: v for k, v in rule.items() if not k.startswith("_")}
+                    for rule in rules
+                ]
+    except Exception:
+        pass
+    
+    # Fallback to defaults
+    return _QUERYABLE_SITE_RULES
 
 # ---------------------------------------------------------------------------
 # Tier definitions
@@ -225,15 +335,7 @@ async def search_resources(
 
     Returns an empty list on any error so the RAG chain degrades gracefully.
     """
-    arango_url = os.getenv("ARANGO_URL", "").rstrip("/")
-    if not arango_url:
-        arango_host = os.getenv("ARANGO_HOST", "host.docker.internal")
-        arango_port = os.getenv("ARANGO_PORT", "8529")
-        arango_url = f"http://{arango_host}:{arango_port}"
-    arango_db = os.getenv("ARANGO_DB", "agri_dao")
-    arango_user = os.getenv("ARANGO_USER", "system")
-    arango_pass = os.getenv("ARANGO_ROOT_PASSWORD") or os.getenv("ARANGO_PASSWORD", "")
-    timeout_s = float(os.getenv("ARANGO_TIMEOUT", "10"))
+    params = _get_arango_connection_params()
 
     keywords = _extract_keywords(query)
     aql, bind_vars = _build_aql(
@@ -247,14 +349,14 @@ async def search_resources(
     )
 
     payload = {"query": aql, "bindVars": bind_vars}
-    endpoint = f"{arango_url}/_db/{arango_db}/_api/cursor"
+    endpoint = f"{params['url']}/_db/{params['db']}/_api/cursor"
 
     try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
+        async with httpx.AsyncClient(timeout=params["timeout"]) as client:
             resp = await client.post(
                 endpoint,
                 json=payload,
-                auth=(arango_user, arango_pass),
+                auth=(params["user"], params["password"]),
                 headers={"Content-Type": "application/json"},
             )
             resp.raise_for_status()
@@ -263,6 +365,79 @@ async def search_resources(
         return data.get("result", [])
     except Exception:
         return []
+
+
+async def _build_site_query_resources(resources: list[dict], query: str) -> list[dict]:
+    if not query:
+        return []
+
+    site_rules = await _get_queryable_site_rules()
+    queryable: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for resource in resources:
+        url = str(resource.get("url") or "").strip()
+        if not url:
+            continue
+
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = parsed.path or "/"
+
+        for rule in site_rules:
+            if rule["domain"] not in host:
+                continue
+            if not path.startswith(rule["path_prefix"]):
+                continue
+
+            site_scope = f"site:{rule['domain']}{rule['path_prefix']}"
+            site_query_url = f"https://search.brave.com/ask?q={quote_plus(site_scope + ' ' + query)}"
+            if site_query_url in seen_urls:
+                continue
+
+            seen_urls.add(site_query_url)
+            queryable.append({
+                "title": f"{rule['title']} ({query})",
+                "url": site_query_url,
+                "description": (
+                    f"Domain-scoped query results for '{query}' against {rule['domain']}{rule['path_prefix']}."
+                ),
+                "source": rule["source"],
+                "source_type": "web_search",
+                "topic": resource.get("topic", "pricing"),
+                "tags": ["site_query", "usda", "gats"],
+                "visibility": "public",
+            })
+
+    return queryable
+
+
+async def _build_direct_site_query_resources(query: str) -> list[dict]:
+    if not _query_mentions_usda_gats(query):
+        return []
+
+    site_rules = await _get_queryable_site_rules()
+    resources: list[dict] = []
+    seen_urls: set[str] = set()
+    for rule in site_rules:
+        site_scope = f"site:{rule['domain']}{rule['path_prefix']}"
+        site_query_url = f"https://search.brave.com/ask?q={quote_plus(site_scope + ' ' + query)}"
+        if site_query_url in seen_urls:
+            continue
+        seen_urls.add(site_query_url)
+        resources.append({
+            "title": f"{rule['title']} ({query})",
+            "url": site_query_url,
+            "description": (
+                f"Domain-scoped query results for '{query}' against {rule['domain']}{rule['path_prefix']}."
+            ),
+            "source": rule["source"],
+            "source_type": "web_search",
+            "topic": "pricing",
+            "tags": ["site_query", "usda", "gats"],
+            "visibility": "public",
+        })
+    return resources
 
 
 async def search_reference_urls(
@@ -277,7 +452,8 @@ async def search_reference_urls(
 
     Returns metadata with inferred filters for observability and debugging.
     """
-    inferred_region = region_id or infer_region_from_query(query)
+    # Prefer query-inferred geography when present; caller region can be stale UI state.
+    inferred_region = infer_region_from_query(query) or region_id
     inferred_topics = infer_topics_from_query(query)
 
     resources = await search_resources(
@@ -301,6 +477,40 @@ async def search_reference_urls(
             require_url=True,
             limit_override=max_urls,
         )
+
+    if not resources:
+        # Relax region filter but keep topical+tier intent.
+        resources = await search_resources(
+            query=query,
+            tier=tier,
+            region_id=None,
+            trusted=trusted,
+            topic_filters=inferred_topics or None,
+            require_url=True,
+            limit_override=max_urls,
+        )
+
+    if not resources:
+        # Last resort: broad URL references across all regions/topics.
+        resources = await search_resources(
+            query=query,
+            tier="broad",
+            region_id=None,
+            trusted=trusted,
+            topic_filters=None,
+            require_url=True,
+            limit_override=max_urls,
+        )
+
+    if resources:
+        site_query_resources = await _build_site_query_resources(resources, query)
+        if site_query_resources:
+            resources = [*resources, *site_query_resources][:max_urls]
+
+    if not resources:
+        direct_site_query = await _build_direct_site_query_resources(query)
+        if direct_site_query:
+            resources = direct_site_query[:max_urls]
 
     return {
         "resources": resources,

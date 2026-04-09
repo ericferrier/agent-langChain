@@ -1,27 +1,4 @@
 services:
-  node-api:
-    build:
-      context: ./node-api
-      dockerfile: Dockerfile
-    environment:
-      - ENV=production
-      - PORT=3000
-      - RAG_URL=${RAG_URL:-http://app:8000}
-      - ARANGO_URL=${ARANGO_URL:-http://10.0.0.1:8529}
-      - ARANGO_USER=${ARANGO_USER:-system}
-      - ARANGO_PASSWORD=${ARANGO_PASSWORD}
-      - ARANGO_DB=${ARANGO_DB:-langchain}
-    ports:
-      - '3000:3000'
-    restart: unless-stopped
-    depends_on:
-      - app
-    logging:
-      driver: json-file
-      options:
-        max-size: '10m'
-        max-file: '3'
-
   app:
     build:
       context: .
@@ -31,7 +8,7 @@ services:
       - PORT=8000
       - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-deepseek-coder:6.7b}
-      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-120}
+      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-180}
       - LANGSMITH_TRACING=${LANGSMITH_TRACING:-true}
       - LANGSMITH_ENDPOINT=${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
       - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
@@ -50,17 +27,12 @@ services:
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 2G
     logging:
       driver: json-file
       options:
         max-size: '10m'
         max-file: '3'
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--loop", "uvloop"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--loop", "uvloop"]
 
   jira-worker:
     build:

@@ -25,7 +25,33 @@ ollama serve
 ```
 
 ## Start stack
- docker compose -f docker-compose.prod.yml up -d
+ Start app/workers stack:
+cd /Users/ericferrier/Documents/GitHub/agri-dao-app/agent-langChain
+docker compose up -d --build
+
+Start node stack:
+cd /Users/ericferrier/Documents/GitHub/agri-dao-app/node-api
+docker compose up -d --build
+
+Re-run smoke probe:
+cd /Users/ericferrier/Documents/GitHub/agri-dao-app/agent-langChain
+./scripts/smoke-timeouts.sh
+
+
+## Start separated stacks
+
+Start Python app/workers stack:
+
+```bash
+docker compose up -d --build
+```
+
+Start Node API stack in a separate compose project:
+
+```bash
+cd ../node-api
+docker compose up -d --build
+```
 
 ## Verify container
  docker compose -f docker-compose.prod.yml ps
@@ -160,9 +186,32 @@ If you see `Unable to generate an answer from Ollama`:
 3. Rebuild and restart containers after code/config changes:
 
 ```bash
-docker compose -f docker-compose.prod.yml build app node-api
-docker compose -f docker-compose.prod.yml up -d
-docker compose -f docker-compose.prod.yml logs -f app node-api
+docker compose build app
+docker compose up -d app jira-worker reference-worker
+docker compose logs -f app jira-worker reference-worker
+
+cd ../node-api
+docker compose build node-api
+docker compose up -d node-api
+docker compose logs -f node-api
+```
+
+4. Run timeout smoke probe:
+
+```bash
+./scripts/smoke-timeouts.sh
+```
+
+Faster troubleshooting mode (shorter max times + live per-step progress):
+
+```bash
+QUICK_MODE=1 ./scripts/smoke-timeouts.sh
+```
+
+Optional end-to-end verify probe with a known batch id:
+
+```bash
+BATCH_ID=<existing-batch-id> ./scripts/smoke-timeouts.sh
 ```
 
 
@@ -254,84 +303,6 @@ docker compose down
 
 ## Reading Notes
 
-
-Got it—if your stack is Oracle Database Express Edition (Oracle XE) + Mistral, here’s a clean, tailored requirements.txt for your Dockerized LangChain service 👇
-
-⸻
-
-📦 requirements.txt (Oracle XE + Mistral)
-
-# LangChain core
-langchain>=0.2.0
-langchain-core>=0.2.0
-langchain-community>=0.2.0
-
-# Mistral LLM
-mistralai>=0.1.0
-
-# Oracle DB driver
-oracledb>=2.0.0
-
-# API server
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-
-# Config & validation
-pydantic>=2.0
-python-dotenv>=1.0.0
-
-# Async / HTTP
-httpx>=0.27.0
-aiofiles>=23.2.1
-
-# Utilities
-tenacity>=8.2.3
-numpy>=1.24.0
-
-
-⸻
-
-🧠 Optional (only if you need them)
-
-➕ Add embeddings / vector search:
-
-sentence-transformers>=2.2.2
-faiss-cpu>=1.7.4
-
-➕ If you plan to use LangChain SQL tools:
-
-sqlalchemy>=2.0
-
-(works with Oracle via oracledb)
-
-⸻
-
-⚠️ Important Oracle note
-
-oracledb has two modes:
- • ✅ Thin mode (default) → works out of the box in Docker (recommended)
- • ⚠️ Thick mode → requires Oracle Instant Client (pain in containers)
-
-👉 Stick to thin mode unless you really need advanced Oracle features.
-
-⸻
-
-🐳 Small Docker tip (for Oracle)
-
-Make sure your container can reach Oracle XE:
-
-ORACLE_DSN=host.docker.internal:1521/XEPDB1
-
-
-⸻
-
-⚡ Minimal working stack idea
- • LangChain → Mistral (LLM reasoning)
- • Oracle XE → structured data (DAO proposals, logs, metadata)
- • Node.js → Solana interactions
- • Python service → AI layer
-
-⸻
 
 💡 One thing to watch (important)
 

@@ -1,5 +1,7 @@
 import os
 
+import asyncio
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Literal, Optional
@@ -7,6 +9,8 @@ from typing import Literal, Optional
 from app.chains.rag import query_rag
 from app.checkpointer.arango_cp import load_session
 from app.services.langsmith_config import initialize_langsmith, langsmith_settings
+from app.services.node_api_client import get_solana_account_balance, node_api_base_url
+from app.services.resource_search import _ensure_site_rules_collection
 
 try:
     from app.services.jira_mock_couch import (
@@ -20,7 +24,7 @@ except Exception:
     get_mock_jira_issue_job = None
 
 try:
-    from app.services.reference_lookup_couch import (
+    from app.services.reference_lookup_jira import (
         enqueue_reference_lookup_job,
         get_reference_lookup_job,
     )
@@ -98,6 +102,9 @@ async def health_check():
             "enabled": LANGSMITH_STATE["enabled"],
             "project": LANGSMITH_STATE["project"],
         },
+        "node_api": {
+            "url": node_api_base_url(),
+        },
     }
 
 
@@ -113,6 +120,20 @@ async def startup_event():
     except Exception as exc:
         LANGSMITH_STATE = langsmith_settings()
         print(f"LangSmith initialization failed: {exc}")
+    
+    # Initialize queryable site rules collection in ArangoDB (non-blocking background task)
+    asyncio.create_task(_ensure_site_rules_collection_bg())
+
+
+async def _ensure_site_rules_collection_bg():
+    """Background task to initialize site rules collection without blocking startup."""
+    try:
+        await asyncio.wait_for(_ensure_site_rules_collection(), timeout=5.0)
+        print("Queryable site rules collection initialized")
+    except asyncio.TimeoutError:
+        print("Warning: Site rules collection initialization timed out (still initializing in background)")
+    except Exception as exc:
+        print(f"Warning: Failed to initialize site rules collection: {exc}")
 
 
 @app.post("/rag/query")
@@ -205,5 +226,14 @@ async def get_session(session_id: str):
         "expires_at": session.get("expires_at"),
         "turns": session.get("turns", []),
     }
+
+
+@app.get("/web3/solana/{address}")
+async def web3_solana_proxy(address: str):
+    """Proxy Solana account lookup through node-api service."""
+    try:
+        return await get_solana_account_balance(address)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Node API unavailable: {exc}")
 
 

@@ -1,11 +1,13 @@
 """
-Reference lookup job service.
+Jira reference lookup job service.
 
 This provides async enqueue/status APIs and a worker loop used by
-`app.main` and `app.workers.reference_worker`.
+app.main and app.workers.reference_worker.
 
-Implementation is intentionally lightweight and resilient: if CouchDB is
-unavailable, callers get deterministic error payloads instead of crashes.
+Implementation is intentionally lightweight and resilient: this is a
+Jira-style lookup mock backed by CouchDB in development. If the backing
+store is unavailable, callers get deterministic error payloads instead of
+crashes.
 """
 from __future__ import annotations
 
@@ -24,18 +26,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _couch_base() -> str:
+def _store_base_url() -> str:
     return (os.getenv("COUCHDB_BASE_URL") or "").rstrip("/")
 
 
-def _couch_auth() -> tuple[str, str]:
+def _store_auth() -> tuple[str, str]:
     return (
         os.getenv("COUCHDB_USER", ""),
         os.getenv("COUCHDB_PASSWORD", ""),
     )
 
 
-def _db_name() -> str:
+def _lookup_db_name() -> str:
     return os.getenv("COUCHDB_DATABASE", "jira_issue")
 
 
@@ -44,7 +46,7 @@ def _jobs_db_name() -> str:
 
 
 async def _ensure_db(client: httpx.AsyncClient, db_name: str) -> None:
-    resp = await client.put(f"{_couch_base()}/{db_name}", auth=_couch_auth())
+    resp = await client.put(f"{_store_base_url()}/{db_name}", auth=_store_auth())
     if resp.status_code not in (200, 201, 202, 412):
         resp.raise_for_status()
 
@@ -66,8 +68,8 @@ async def _create_job_doc(payload: dict[str, Any]) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=10.0) as client:
         await _ensure_db(client, _jobs_db_name())
         resp = await client.put(
-            f"{_couch_base()}/{_jobs_db_name()}/{job_id}",
-            auth=_couch_auth(),
+            f"{_store_base_url()}/{_jobs_db_name()}/{job_id}",
+            auth=_store_auth(),
             json=doc,
             headers={"Content-Type": "application/json"},
         )
@@ -77,7 +79,7 @@ async def _create_job_doc(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def enqueue_reference_lookup_job(payload: dict[str, Any]) -> dict[str, Any]:
-    if not _couch_base():
+    if not _store_base_url():
         return {"ok": False, "error": "couchdb_not_configured"}
     try:
         return await _create_job_doc(payload)
@@ -86,14 +88,14 @@ async def enqueue_reference_lookup_job(payload: dict[str, Any]) -> dict[str, Any
 
 
 async def get_reference_lookup_job(job_id: str) -> dict[str, Any]:
-    if not _couch_base():
+    if not _store_base_url():
         return {"ok": False, "error": "couchdb_not_configured"}
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{_couch_base()}/{_jobs_db_name()}/{job_id}",
-                auth=_couch_auth(),
+                f"{_store_base_url()}/{_jobs_db_name()}/{job_id}",
+                auth=_store_auth(),
             )
             if resp.status_code == 404:
                 return {"ok": False, "error": "job_not_found", "job_id": job_id}
@@ -120,8 +122,8 @@ async def _fetch_pending_jobs(client: httpx.AsyncClient, limit: int = 5) -> list
         "limit": limit,
     }
     resp = await client.post(
-        f"{_couch_base()}/{_jobs_db_name()}/_find",
-        auth=_couch_auth(),
+        f"{_store_base_url()}/{_jobs_db_name()}/_find",
+        auth=_store_auth(),
         json=query,
         headers={"Content-Type": "application/json"},
     )
@@ -132,8 +134,8 @@ async def _fetch_pending_jobs(client: httpx.AsyncClient, limit: int = 5) -> list
 async def _update_job(client: httpx.AsyncClient, doc: dict[str, Any]) -> None:
     doc["updated_at"] = _now()
     resp = await client.put(
-        f"{_couch_base()}/{_jobs_db_name()}/{doc['_id']}",
-        auth=_couch_auth(),
+        f"{_store_base_url()}/{_jobs_db_name()}/{doc['_id']}",
+        auth=_store_auth(),
         json=doc,
         headers={"Content-Type": "application/json"},
     )
@@ -144,7 +146,7 @@ async def run_reference_worker_loop() -> None:
     poll_s = float(os.getenv("REFERENCE_WORKER_POLL_SECONDS", "3.0"))
     max_retries = int(os.getenv("REFERENCE_WORKER_MAX_RETRIES", "3"))
 
-    if not _couch_base():
+    if not _store_base_url():
         while True:
             await asyncio.sleep(max(1.0, poll_s))
 

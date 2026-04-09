@@ -24,14 +24,19 @@
 
 ### Retrieval Layer (`app/services/resource_search.py`)
 - [x] Created tiered keyword search service against ArangoDB
-- [x] Defined three search tiers:
+- [x] Defined four search tiers:
   - `broad` — all sources, no restriction (limit 10)
   - `compliance` — `regulation_summary`, `policy`, `certification`, `product_doc`; topics: `export-documents`, `compliance-region` (limit 8)
   - `fulfillment` — `logistics_hub`, `trade_portal`, `runbook`, `market_guide`, `trade_fair`; topics: `shipping-logistics`, `marketplace-listing` (limit 8)
+  - `pricing` — `trade_portal`, `market_guide`, `product_doc`, `directory`, `runbook`; topics: `pricing` (limit 8)
 - [x] Keyword extraction with stopword stripping (LIKE-based AQL filter on title, description, tags)
 - [x] Optional `region_id` scoping per query
 - [x] Visibility enforcement: `trusted=False` → only `public` resources; `trusted=True` → all resources
 - [x] `format_resources_as_context()` — formats matched resources into LLM prompt context block
+- [x] Added query-inferred region/topic routing for reference URL discovery
+- [x] Added URL-first fallback cascade in `search_reference_urls()` (strict → relaxed filters)
+- [x] Added ArangoDB-backed `queryable_site_rules` collection with runtime fallback to defaults
+- [x] Removed hardcoded curated fallback references (e.g. foodcoop) now that DB-backed references are authoritative
 
 ### RAG Chain (`app/chains/rag.py`)
 - [x] Wired ArangoDB resource retrieval into Ollama prompt
@@ -41,6 +46,7 @@
 - [x] Added deterministic degraded fallback payload when Ollama is unavailable
 - [x] Added explicit contract fields on responses: `status`, `verified`, `verification_status`, `llm_available`, `should_retry`, `error`
 - [x] Reduced Ollama timeout pressure with faster fail behavior to avoid long worker blocking
+- [x] Added parallel async lookup orchestration for reference/resource stages to improve consistency under latency
 
 ### API (`app/main.py`)
 - [x] `POST /rag/query` upgraded to typed `RagRequest` Pydantic model
@@ -48,6 +54,12 @@
 - [x] `GET /session/{session_id}` endpoint returns full conversation history
 - [x] Removed dead Oracle service file and references
 - [x] `/health` now exposes LangSmith tracing status
+- [x] Startup now initializes queryable site rules in non-blocking background task
+
+### Performance & Reliability
+- [x] Moved queryable site-rule bootstrap off critical startup path (background + timeout guard)
+- [x] Ensured ArangoDB connection config is environment-driven (no fixed host/IP in search service)
+- [x] Kept graceful degradation path when ArangoDB rule lookup is unavailable
 
 ### Observability (LangSmith)
 - [x] Enabled LangSmith tracing env wiring in compose (`LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, `LANGSMITH_ENDPOINT`)
@@ -86,7 +98,7 @@
 
 ---
 
-## 🔲 Up Next — Phase 1 Completion
+## 🔲  Phase 1 Completion
 
 - [x] Define supported issue categories (public user scope)
   - `marketplace`: listing, discovery, product posting, buyer/seller workflow
@@ -125,19 +137,39 @@
 ---
 
 
+## In Progress
+
+### Phase 10 — Optimization 
+- [ ] Add end-to-end latency budget per stage (retrieval, fetch, scoring, generation)
+- [ ] Add structured timing logs for each RAG stage and expose via `/health` or debug endpoint
+- [ ] Implement adaptive generation limits (tokens/temperature/timeouts by query type)
+- [ ] Cache short-lived reference lookup results for repeated queries
+- [ ] Add load test scenarios for pricing/USDA/GATS query patterns
+- [ ] Define SLOs (p50/p95 latency, timeout rate) and alert thresholds
+- [ ] Add benchmark script for model-only vs retrieval-only vs full pipeline timings
+
+
+### Phase 8 — Escalation Logic
+- [x] Low-confidence threshold triggers
+- [ ] Escalate when retrieval returns weak or no evidence
+- [ ] Escalate when user confirms answer did not help
+- [ ] Auto-escalate high-severity categories
+- [ ] Summary generator for Jira ticket descriptions
+- [ ] Include user prompt, attempted answer, and context in ticket body
+
 
 ### Phase 6 — LLM Integration Started
 - [ ] Support-answer chain separate from generic generation
-- [ ] Consistent response format for UI
+- [x] Consistent response format for UI
 - [ ] Log model failures and latency
 - [x] Safe fallback when Ollama is unavailable
 - [ ] Isolate Ollama runtime behavior (ReadTimeout) outside RAG: run direct Ollama benchmark with tiny prompts, single-worker mode, and no retrieval context to determine root cause (model runtime vs host resource contention vs transport timeout)
 
 
 ### Phase 2 — UX & Application Flow
-- [ ] Simple web UI with support-only prompt box
-- [ ] Issue category selector to improve routing
-- [ ] Show answer, confidence score, and source citations
+- [x] Simple web UI with support-only prompt box
+- [x] Issue category selector to improve routing
+- [x] Show answer, confidence score, and source citations
 - [ ] Wire UI to LangGraph workflow endpoints (`POST /workflow/run/{thread_id}`, `POST /workflow/resume/{thread_id}`) with persisted `thread_id`
 - [ ] "Create Jira ticket" action when answer is insufficient
 - [ ] User confirmation step before ticket submission
@@ -149,9 +181,15 @@
 - [ ] Store question, answer, confidence, escalation decision, ticket key (Check if question was prompt within past 24 hrs before fetching content to arangoDB)
 - [ ] Store user feedback on whether answer solved the issue
 
-## 🔲 Upcoming Phases (started)
+### Phase 4 — Prompt Guardrails
+- [x] System prompt restricting assistant to platform support topics
+- [ ] Out-of-scope rejection / redirect behavior
+- [x] Prevent model from inventing policies or unsupported steps
+- [ ] Explicit escalation instruction when confidence is low
+- [ ] Prompt tests for in-scope and out-of-scope requests
 
 
+## 🔲 Upcoming Phases (Not started)
 
 ### Phase 3 — Backend API Design
 - [ ] Auth gate: only verified trusted accounts can set `trusted=True` on `/rag/query`
@@ -161,12 +199,6 @@
 - [ ] Request/response schema validation (Pydantic)
 - [ ] Structured error handling for LLM, retrieval, and Jira failures
 
-### Phase 4 — Prompt Guardrails
-- [ ] System prompt restricting assistant to platform support topics
-- [ ] Out-of-scope rejection / redirect behavior
-- [ ] Prevent model from inventing policies or unsupported steps
-- [ ] Explicit escalation instruction when confidence is low
-- [ ] Prompt tests for in-scope and out-of-scope requests
 
 ### Phase 5 — Knowledge & Retrieval
 - [ ] Index internal product support docs (onboarding, wallet, DAO, marketplace, export)
@@ -186,13 +218,6 @@
 - [ ] Return ticket key, URL, and creation result to UI
 - [ ] Handle duplicate/repeated ticket submissions safely
 
-### Phase 8 — Escalation Logic
-- [ ] Low-confidence threshold triggers
-- [ ] Escalate when retrieval returns weak or no evidence
-- [ ] Escalate when user confirms answer did not help
-- [ ] Auto-escalate high-severity categories
-- [ ] Summary generator for Jira ticket descriptions
-- [ ] Include user prompt, attempted answer, and context in ticket body
 
 
 
@@ -202,12 +227,12 @@
 
 | Item | Value |
 |---|---|
-| ArangoDB URL | `http://10.0.0.1:8529` |
+| ArangoDB URL | from env (`ARANGO_URL` or `ARANGO_HOST` + `ARANGO_PORT`) |
 | Database | `agri_dao` |
-| Collections | `resource`, `region`, region→resource edges |
+| Collections | `resource`, `region`, region→resource edges, `queryable_site_rules` |
 | Resource count | 205 |
 | Python venv | `/Users/ericferrier/Documents/GitHub/agri-dao-app/.venv/bin/python` |
 | Seed script | `db/init/02_resources.py` |
 | LLM | Ollama / Mistral (via `OLLAMA_URL`) |
-| Search tiers | `broad` → `compliance` → `fulfillment` |
+| Search tiers | `broad` → `compliance` → `fulfillment` → `pricing` |
 | Visibility values | `public`, `system` |

@@ -1,7 +1,9 @@
+import asyncio
 import os
 import uuid
 from typing import Any, Optional
 import re
+from urllib.parse import quote_plus
 
 import httpx
 from langsmith import traceable
@@ -15,6 +17,7 @@ from app.services.content_fetch import (
 from app.services.content_lookup import load_content_for_query_id
 from app.services.resource_search import (
     format_resources_as_context,
+    infer_region_from_query,
     search_reference_urls,
     search_resources,
 )
@@ -49,6 +52,13 @@ _NON_GROUNDED_PATTERNS = [
     "as a coding",
     "outside my expertise",
 ]
+
+_BRAVE_ASK_BASE = "https://search.brave.com/ask"
+
+
+def _is_fast_scope_query(query: str) -> bool:
+    q = (query or "").lower()
+    return any(token in q for token in ["usda", "fas", "gats", "global agricultural trade system"])
 
 
 def _budget_limit() -> int:
@@ -131,8 +141,8 @@ def _build_quota_exhausted_response(
         "sources": [],
         "confidence": 0.0,
         "confidence_label": "low",
-        "escalate": True,
-        "escalation_reason": "anonymous_quality_budget_exhausted",
+        "escalate": False,
+        "escalation_reason": "anonymous_quality_budget_exhausted (manual escalation available)",
         "user_can_escalate": True,
         "session_id": session_id,
         "resumed": False,
@@ -166,8 +176,8 @@ def _build_unverified_fallback(
         "sources": [],
         "confidence": 0.0,
         "confidence_label": "low",
-        "escalate": True,
-        "escalation_reason": reason,
+        "escalate": False,
+        "escalation_reason": f"{reason} (manual escalation available)",
         "user_can_escalate": True,
         "session_id": session_id,
         "resumed": False,
@@ -185,7 +195,9 @@ def _build_unverified_fallback(
 
 def _normalize_success_result(result: dict[str, Any]) -> dict[str, Any]:
     """Ensure successful responses expose the same contract as fallback responses."""
-    is_verified = not bool(result.get("escalate", False))
+    confidence = float(result.get("confidence") or 0.0)
+    confidence_label = str(result.get("confidence_label") or "").strip().lower()
+    is_verified = confidence >= 0.70 and confidence_label == "satisfactory"
     return {
         **result,
         "status": "ok",
@@ -199,7 +211,10 @@ def _normalize_success_result(result: dict[str, Any]) -> dict[str, Any]:
 
 def _build_grounded_reference_answer(query: str, resources: list[dict[str, Any]]) -> str:
     if not resources:
-        return "No supporting resources were found for this query."
+        return (
+            "No supporting knowledge-base resources were found for this query. "
+            f"Please cross-reference on {_brave_ask_url(query)}."
+        )
 
     # Extract summaries and build a grounded narrative from available resources
     lines = [
@@ -234,9 +249,57 @@ def _ensure_grounded_answer(answer: str, query: str, resources: list[dict[str, A
     if not resources:
         return answer
     lower = answer.lower()
-    if any(pattern in lower for pattern in _NON_GROUNDED_PATTERNS):
+    if any(pattern in lower for pattern in _NON_GROUNDED_PATTERNS) or _contains_unapproved_urls(answer, resources):
         return _build_grounded_reference_answer(query, resources)
     return answer
+
+
+def _contains_unapproved_urls(answer: str, resources: list[dict[str, Any]]) -> bool:
+    # Keep answers grounded to returned resources by rejecting off-list links in model text.
+    found_urls = re.findall(r"https?://[^\s)\]>\"]+", answer or "")
+    if not found_urls:
+        return False
+
+    allowed_urls = {
+        str(resource.get("url") or "").rstrip("/ ").lower()
+        for resource in resources
+        if resource.get("url")
+    }
+
+    for url in found_urls:
+        cleaned = url.rstrip("/.,);:!?]>").lower()
+        if cleaned and cleaned not in allowed_urls:
+            return True
+    return False
+
+
+def _brave_ask_url(query: str) -> str:
+    q = (query or "").strip()
+    if not q:
+        return _BRAVE_ASK_BASE
+    return f"{_BRAVE_ASK_BASE}?q={quote_plus(q)}"
+
+
+def _build_sources(resources: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    sources = [
+        {"title": r.get("title"), "url": r.get("url"), "source_type": r.get("source_type")}
+        for r in resources
+    ]
+
+    brave_source = {
+        "title": "Brave Ask cross-reference",
+        "url": _brave_ask_url(query),
+        "source_type": "web_search",
+    }
+
+    if not sources:
+        return [brave_source]
+
+    already_has_brave = any(_BRAVE_ASK_BASE in str(src.get("url") or "") for src in sources)
+    if not already_has_brave:
+        sources.append(brave_source)
+
+    return sources
 
 
 def _format_reference_resource_context(resources: list[dict[str, Any]]) -> str:
@@ -350,6 +413,12 @@ async def _worker_match_resources(
     resources = await search_resources(query, tier=tier, region_id=region_id, trusted=trusted)
     if not resources:
         resources = await search_resources("", tier=tier, region_id=region_id, trusted=trusted)
+    if not resources:
+        # Relax region scope to recover globally relevant references.
+        resources = await search_resources(query, tier=tier, region_id=None, trusted=trusted)
+    if not resources and tier != "broad":
+        # Last resort for sparse datasets.
+        resources = await search_resources(query, tier="broad", region_id=None, trusted=trusted)
     return resources
 
 
@@ -359,6 +428,7 @@ async def _worker_strip_store_content(
     query: str,
     session_id: str,
     resources: list[dict[str, Any]],
+    timeout_s: float = 5.0,
 ) -> dict[str, Optional[str]]:
     if not resources:
         return {}
@@ -367,7 +437,7 @@ async def _worker_strip_store_content(
         query=query,
         session_id=session_id,
         resources=resources,
-        timeout_s=5.0,
+        timeout_s=timeout_s,
     )
 
 
@@ -425,9 +495,9 @@ async def _resolve_reference_lookup(
     trusted: bool,
     reference_lookup: bool,
     reference_job_id: Optional[str],
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
     if not reference_lookup and not reference_job_id:
-        return {"enabled": False, "status": "disabled"}, ""
+        return {"enabled": False, "status": "disabled"}, "", []
 
     lookup = await search_reference_urls(
         query=query,
@@ -442,7 +512,26 @@ async def _resolve_reference_lookup(
         "status": "direct_arango",
         "matches": len(resources),
         "filters": lookup.get("filters", {}),
-    }, _format_reference_resource_context(resources)
+    }, _format_reference_resource_context(resources), resources
+
+
+def _merge_resources(
+    primary: list[dict[str, Any]],
+    secondary: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for resource in [*(primary or []), *(secondary or [])]:
+        url = str(resource.get("url") or "").strip()
+        title = str(resource.get("title") or "").strip()
+        key = (url or title).lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(resource)
+
+    return merged
 
 
 @traceable(run_type="chain", name="query_rag")
@@ -470,6 +559,8 @@ async def query_rag(
     # --- Session resolution
     sid = session_id or str(uuid.uuid4())
     qid = query_id or str(uuid.uuid4())
+    effective_region_id = infer_region_from_query(query) or region_id
+    fast_scope = _is_fast_scope_query(query)
     session = await load_session(sid) if session_id else None
     limit = _budget_limit()
     spent = _session_spent_budget(session)
@@ -494,7 +585,7 @@ async def query_rag(
             query=query,
             query_id=qid,
             tier=tier,
-            region_id=region_id,
+            region_id=effective_region_id,
             session_id=sid,
             model=os.getenv("OLLAMA_MODEL", "mistral:latest"),
             used=spent,
@@ -519,13 +610,53 @@ async def query_rag(
         ollama_retry_read_timeout = ollama_retry_read_timeout_s
     retry_num_predict = int(os.getenv("OLLAMA_RETRY_NUM_PREDICT", "120"))
 
-    # --- Worker 1: retrieve scoped resources
-    resources = await _worker_match_resources(
-        query=query,
-        tier=tier,
-        region_id=region_id,
-        trusted=trusted,
+    # Fast-scope mode for USDA/GATS style requests: keep latency predictable.
+    if fast_scope:
+        timeout_s = min(timeout_s, float(os.getenv("FAST_SCOPE_OLLAMA_TIMEOUT", "12")))
+        if ollama_read_timeout is None:
+            ollama_read_timeout = float(os.getenv("FAST_SCOPE_OLLAMA_READ_TIMEOUT", "20"))
+        else:
+            ollama_read_timeout = min(ollama_read_timeout, float(os.getenv("FAST_SCOPE_OLLAMA_READ_TIMEOUT", "20")))
+        num_predict = min(num_predict, int(os.getenv("FAST_SCOPE_OLLAMA_NUM_PREDICT", "96")))
+        retry_timeout_s = min(retry_timeout_s, float(os.getenv("FAST_SCOPE_RETRY_TIMEOUT", "16")))
+        if ollama_retry_read_timeout is None:
+            ollama_retry_read_timeout = float(os.getenv("FAST_SCOPE_RETRY_READ_TIMEOUT", "24"))
+        else:
+            ollama_retry_read_timeout = min(
+                ollama_retry_read_timeout,
+                float(os.getenv("FAST_SCOPE_RETRY_READ_TIMEOUT", "24")),
+            )
+        retry_num_predict = min(retry_num_predict, int(os.getenv("FAST_SCOPE_RETRY_NUM_PREDICT", "72")))
+
+    lookup_task_timeout = float(os.getenv("FAST_SCOPE_LOOKUP_TIMEOUT", "8")) if fast_scope else float(os.getenv("LOOKUP_TIMEOUT", "25"))
+    resource_match_timeout = float(os.getenv("FAST_SCOPE_RESOURCE_MATCH_TIMEOUT", "8")) if fast_scope else float(os.getenv("RESOURCE_MATCH_TIMEOUT", "25"))
+    fetch_timeout = float(os.getenv("FAST_SCOPE_FETCH_TIMEOUT", "4")) if fast_scope else float(os.getenv("REFERENCE_FETCH_TIMEOUT", "5"))
+
+    # --- Run independent lookups in parallel to reduce end-to-end latency.
+    reference_lookup_task = asyncio.create_task(
+        _resolve_reference_lookup(
+            query=query,
+            tier=tier,
+            region_id=effective_region_id,
+            trusted=trusted,
+            reference_lookup=reference_lookup,
+            reference_job_id=reference_job_id,
+        )
     )
+
+    # --- Worker 1: retrieve scoped resources
+    try:
+        resources = await asyncio.wait_for(
+            _worker_match_resources(
+                query=query,
+                tier=tier,
+                region_id=effective_region_id,
+                trusted=trusted,
+            ),
+            timeout=resource_match_timeout,
+        )
+    except asyncio.TimeoutError:
+        resources = []
 
     # --- Worker 2: strip/extract URL content and store in ArangoDB
     fetched_content_map: dict[str, Optional[str]] = {}
@@ -535,6 +666,7 @@ async def query_rag(
             query=query,
             session_id=sid,
             resources=resources,
+            timeout_s=fetch_timeout,
         )
 
     # --- Worker 3: read from ArangoDB, hydrate resources, prioritize context
@@ -547,14 +679,54 @@ async def query_rag(
         )
     
     context_block = format_resources_as_context(resources, query=query)
-    reference_meta, web_excerpt_context = await _resolve_reference_lookup(
-        query=query,
-        tier=tier,
-        region_id=region_id,
-        trusted=trusted,
-        reference_lookup=reference_lookup,
-        reference_job_id=reference_job_id,
-    )
+    try:
+        reference_meta, web_excerpt_context, lookup_resources = await asyncio.wait_for(
+            reference_lookup_task,
+            timeout=lookup_task_timeout,
+        )
+    except asyncio.TimeoutError:
+        reference_meta, web_excerpt_context, lookup_resources = (
+            {"enabled": True, "status": "timeout", "matches": 0, "filters": {}},
+            "",
+            [],
+        )
+    all_resources = _merge_resources(resources, lookup_resources)
+
+    if fast_scope:
+        # Deterministic fast response path avoids LLM stalls for site-scoped discovery queries.
+        answer = _build_grounded_reference_answer(query, all_resources)
+        confidence = score_answer(query, answer, all_resources)
+        if force_escalate and not confidence["escalate"]:
+            confidence["escalate"] = True
+            confidence["escalation_reason"] = "User requested manual escalation"
+
+        result = {
+            "query": query,
+            "query_id": qid,
+            "answer": answer,
+            "sources": _build_sources(all_resources, query),
+            "reference_lookup": reference_meta,
+            "confidence": confidence["confidence"],
+            "confidence_label": confidence["label"],
+            "escalate": confidence["escalate"],
+            "escalation_reason": confidence["escalation_reason"],
+            "user_can_escalate": True,
+            "session_id": sid,
+            "resumed": False,
+            "tier": tier,
+            "region_id": effective_region_id,
+            "model": model,
+        }
+        result = _normalize_success_result(result)
+        spent_after = spent + _turn_cost(result)
+        result = _attach_budget_meta(
+            result,
+            used=spent_after,
+            limit=limit,
+            estimated_next_cost=_estimate_next_cost(tier),
+        )
+        await save_turn(sid, make_turn(query, result), region_id=effective_region_id, tier=tier, trusted=trusted)
+        return result
 
     # --- Step 2: build grounded prompt
     if context_block or web_excerpt_context:
@@ -563,6 +735,7 @@ async def query_rag(
             "You are a trade and agricultural compliance assistant. "
             "Answer the user question using ONLY the provided resources where possible. "
             "Cite the resource title and URL when relevant. "
+            "Do not cite or mention any URL that is not present in the provided resources. "
             "If exact numeric values are missing, state that clearly and provide the best next sources from context. "
             "Do NOT mention model identity, AI limitations, coding focus, or inability to access the internet. "
             "Stay grounded to the provided references and respond as a support analyst.\n\n"
@@ -577,10 +750,7 @@ async def query_rag(
 
     prompt = f"{system_note}Question: {query}"
 
-    sources = [
-        {"title": r.get("title"), "url": r.get("url"), "source_type": r.get("source_type")}
-        for r in resources
-    ]
+    sources = _build_sources(all_resources, query)
 
     try:
         data = await _ollama_generate(
@@ -593,8 +763,8 @@ async def query_rag(
         )
 
         answer = data.get("response", "").strip() or "No response generated."
-        answer = _ensure_grounded_answer(answer, query, resources)
-        confidence = score_answer(query, answer, resources)
+        answer = _ensure_grounded_answer(answer, query, all_resources)
+        confidence = score_answer(query, answer, all_resources)
 
         # User manual override: escalate regardless of computed score
         if force_escalate and not confidence["escalate"]:
@@ -615,7 +785,7 @@ async def query_rag(
             "session_id": sid,
             "resumed": False,
             "tier": tier,
-            "region_id": region_id,
+            "region_id": effective_region_id,
             "model": model,
         }
         result = _normalize_success_result(result)
@@ -628,7 +798,7 @@ async def query_rag(
         )
 
         # Persist turn (non-fatal — checkpoint failure must not break the response)
-        await save_turn(sid, make_turn(query, result), region_id=region_id, tier=tier, trusted=trusted)
+        await save_turn(sid, make_turn(query, result), region_id=effective_region_id, tier=tier, trusted=trusted)
 
         return result
     except httpx.TimeoutException:
@@ -645,8 +815,8 @@ async def query_rag(
             )
 
             answer = retry_data.get("response", "").strip() or "No response generated."
-            answer = _ensure_grounded_answer(answer, query, resources)
-            confidence = score_answer(query, answer, resources)
+            answer = _ensure_grounded_answer(answer, query, all_resources)
+            confidence = score_answer(query, answer, all_resources)
 
             if force_escalate and not confidence["escalate"]:
                 confidence["escalate"] = True
@@ -666,7 +836,7 @@ async def query_rag(
                 "session_id": sid,
                 "resumed": False,
                 "tier": tier,
-                "region_id": region_id,
+                "region_id": effective_region_id,
                 "model": model,
             }
             result = _normalize_success_result(result)
@@ -677,14 +847,14 @@ async def query_rag(
                 limit=limit,
                 estimated_next_cost=_estimate_next_cost(tier),
             )
-            await save_turn(sid, make_turn(query, result), region_id=region_id, tier=tier, trusted=trusted)
+            await save_turn(sid, make_turn(query, result), region_id=effective_region_id, tier=tier, trusted=trusted)
             return result
         except httpx.TimeoutException:
-            grounded_fallback_answer = _build_grounded_reference_answer(query, resources)
+            grounded_fallback_answer = _build_grounded_reference_answer(query, all_resources)
             fallback = _build_unverified_fallback(
                 query=query,
                 tier=tier,
-                region_id=region_id,
+                region_id=effective_region_id,
                 session_id=sid,
                 model=model,
                 reason="LLM unavailable: timeout",
@@ -702,21 +872,18 @@ async def query_rag(
             )
     except Exception as exc:
         reason = f"LLM unavailable: {exc}" if str(exc) else "LLM unavailable: unknown error"
-        grounded_fallback_answer = _build_grounded_reference_answer(query, resources)
+        grounded_fallback_answer = _build_grounded_reference_answer(query, all_resources)
         fallback = _build_unverified_fallback(
             query=query,
             tier=tier,
-            region_id=region_id,
+            region_id=effective_region_id,
             session_id=sid,
             model=model,
             reason=reason,
         )
         fallback["query_id"] = qid
         fallback["answer"] = grounded_fallback_answer
-        fallback["sources"] = [
-            {"title": r.get("title"), "url": r.get("url"), "source_type": r.get("source_type")}
-            for r in resources
-        ]
+        fallback["sources"] = _build_sources(all_resources, query)
         fallback["reference_lookup"] = reference_meta
         spent_after = spent + _turn_cost(fallback)
         return _attach_budget_meta(
